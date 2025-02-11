@@ -1,15 +1,82 @@
-# Конфиденциальные данные
-.env
-.env.local
-
-# Кэш Python
+### Python ###
+# Byte-compiled files
 __pycache__/
 *.py[cod]
+*$py.class
 
-# Базы данных
-*.db
-*.sqlite3
-
-# Виртуальное окружение
+# Virtual environment
 venv/
+.env/
+.venv/
 env/
+
+# Logs and databases
+*.log
+*.sqlite
+*.db
+pg_data/
+
+# Environment files
+.env
+.env.local
+.env.*.local
+secrets.yml
+
+# IDE
+.idea/
+.vscode/
+*.iml
+*.swp
+*.swo
+
+# Build/static files
+build/
+dist/
+*.egg-info/
+staticfiles/
+
+# Testing
+.coverage
+.coverage.*
+.cache
+.pytest_cache/
+test-reports/
+
+# Docker
+docker-compose.override.yml
+*.dockerignore
+
+# PostgreSQL backups
+*.dump
+*.backup
+*.sql
+
+# Flask
+instance/
+.webassets-cache
+
+# Миграции (если используете Alembic)
+alembic/versions/*
+
+# Специфичные для проекта файлы
+config_local.py
+/bot/local_settings.py
+
+# Системные файлы
+.DS_Store
+Thumbs.db
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+*.ipynb
+
+# PyCharm
+.idea/workspace.xml
+.idea/tasks.xml
+.idea/dictionaries
+.idea/vcs.xml
+.idea/jsLibraryMappings.xml
+
+# VS Code
+.vscode/settings.json
+.vscode/launch.json

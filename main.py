@@ -1,18 +1,17 @@
 import os
 import sqlite3
 import logging
-import asyncio
 import signal
 import re
-from datetime import datetime
 from threading import Thread
-from flask import Flask, request
+from datetime import datetime
+from flask import Flask
 from telegram import (
-    Update, 
-    InlineKeyboardButton, 
-    InlineKeyboardMarkup, 
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
     ReplyKeyboardMarkup,
-    error as telegram_error
+    ReplyKeyboardRemove
 )
 from telegram.ext import (
     ApplicationBuilder,
@@ -24,7 +23,7 @@ from telegram.ext import (
     CallbackQueryHandler
 )
 
-# ========== ИНИЦИАЛИЗАЦИЯ FLASK ==========
+# ========== FLASK INIT ==========
 app = Flask(__name__)
 
 @app.route('/')
@@ -34,12 +33,12 @@ def home():
 def run_flask():
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 10000)))
 
-# ========== КОНФИГУРАЦИЯ ==========
-BOT_TOKEN = os.environ.get('7833583184:AAGRYKayEY1wjP8TZs9rVrNgbSLAAQwHFGY')
-ADMIN_CHAT_ID = os.environ.get(' 694873692')
+# ========== CONFIG ==========
+BOT_TOKEN = os.environ.get('BOT_TOKEN')
+ADMIN_CHAT_ID = int(os.environ.get('ADMIN_CHAT_ID'))
 DB_NAME = "applications.db"
 
-# ========== ЭТАПЫ ДИАЛОГА ==========
+# ========== DIALOG STATES ==========
 (
     CITIZENSHIP,
     CITIZENSHIP_SNG,
@@ -57,60 +56,58 @@ DB_NAME = "applications.db"
     EDIT_FIELD,
 ) = range(14)
 
-# ========== НАСТРОЙКА ЛОГГИРОВАНИЯ ==========
+# ========== LOGGING ==========
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# ========== БАЗА ДАННЫХ ==========
+# ========== DATABASE ==========
 def init_db():
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS applications (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            username TEXT,
-            full_name TEXT NOT NULL,
-            citizenship TEXT NOT NULL,
-            prior_employment TEXT,
-            employment_period TEXT,
-            phone TEXT NOT NULL,
-            city TEXT NOT NULL,
-            age INTEGER NOT NULL,
-            self_employed TEXT NOT NULL,
-            self_employed_choice TEXT,
-            transport TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            status TEXT DEFAULT 'new'
-        )
-    """)
-    conn.commit()
-    conn.close()
+    try:
+        conn = psycopg2.connect(DATABASE_URL, sslmode='require')
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS applications (
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                username TEXT,
+                full_name TEXT NOT NULL,
+                citizenship TEXT NOT NULL,
+                prior_employment TEXT,
+                employment_period TEXT,
+                phone TEXT NOT NULL,
+                city TEXT NOT NULL,
+                age INTEGER NOT NULL,
+                self_employed TEXT NOT NULL,
+                self_employed_choice TEXT,
+                transport TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                status TEXT DEFAULT 'new'
+            )
+        """)
+        conn.commit()
+    except Exception as e:
+        logger.error(f"Ошибка инициализации БД: {str(e)}")
+    finally:
+        if conn:
+            conn.close()
 
 def save_application(user_data, user_id, username):
+    conn = None
     try:
-        conn = sqlite3.connect(DB_NAME)
+        conn = psycopg2.connect(DATABASE_URL, sslmode='require')
         cursor = conn.cursor()
         
         cursor.execute("""
             INSERT INTO applications (
-                user_id,
-                username,
-                full_name,
-                citizenship,
-                prior_employment,
-                employment_period,
-                phone,
-                city,
-                age,
-                self_employed,
-                self_employed_choice,
-                transport
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                user_id, username, full_name, citizenship, 
+                prior_employment, employment_period, phone, 
+                city, age, self_employed, self_employed_choice, transport
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING id
         """, (
             user_id,
             username,
@@ -126,31 +123,77 @@ def save_application(user_data, user_id, username):
             user_data.get('transport')
         ))
         
+        app_id = cursor.fetchone()[0]
         conn.commit()
-        return cursor.lastrowid
-    except sqlite3.Error as e:
-        logger.error(f"Ошибка сохранения в БД: {e}")
+        return app_id
+        
+    except Exception as e:
+        logger.error(f"Ошибка БД: {str(e)}")
         return None
     finally:
-        conn.close()
+        if conn:
+            conn.close()
 
-# ========== ВАЛИДАЦИЯ ДАННЫХ ==========
-def validate_application(data: dict) -> bool:
-    required_fields = [
-        'citizenship', 
-        'full_name',
-        'phone',
-        'city',
-        'age',
-        'self_employed',
-        'transport'
-    ]
-    return all(data.get(field) for field in required_fields)
+# ========== VALIDATION ==========
+RUSSIAN_CITIES = {
+    'москва', 'санкт-петербург', 'новосибирск', 'екатеринбург', 'нижний новгород',
+    'казань', 'челябинск', 'самара', 'омск', 'ростов-на-дону', 'уфа', 'красноярск',
+    'пермь', 'воронеж', 'волгоград', 'краснодар', 'саратов', 'тюмень', 'тольятти',
+    'ижевск', 'барнаул', 'иркутск', 'ульяновск', 'хабаровск', 'ярославль', 'владивосток',
+    'махачкала', 'томск', 'оренбург', 'кемерово', 'новокузнецк', 'рязань', 'астрахань',
+    'набережные челны', 'пенза', 'липецк', 'киров', 'чебоксары', 'калининград', 'тула',
+    'ставрополь', 'курск', 'сочи', 'тверь', 'магнитогорск', 'иваново', 'брянск', 'белгород',
+    'сургут', 'владимир', 'архангельск', 'калуга', 'смоленск', 'вологда', 'салават', 'чита',
+    'орёл', 'волжский', 'череповец', 'владикавказ', 'мурманск', 'петрозаводск', 'кострома',
+    'нижневартовск', 'новороссийск', 'йошкар-ола', 'таганрог', 'сыктывкар', 'нальчик',
+    'шахты', 'дзержинск', 'благовещенск', 'элиста', 'псков', 'бийск', 'прокопьевск',
+    'ангарск', 'ставрополь', 'люберцы', 'мытищи', 'балашиха', 'химки', 'королёв', 'подольск',
+    'севастополь', 'сургут', 'новый уренгой', 'волгодонск', 'абдулино', 'азов', 'александров',
+    'алексин', 'альметьевск', 'анапа', 'апатиты', 'арзамас', 'армавир', 'артём', 'архангельск',
+    'асбест', 'ачинск', 'балаково', 'балахна', 'батайск', 'белогорск', 'белорецк', 'белореченск',
+    'бердск', 'березники', 'беслан', 'бор', 'борисоглебск', 'братск', 'бугульма', 'будённовск',
+    'бузулук', 'буйнакск', 'великие луки', 'великий новгород', 'видное', 'воборка', 'волжск',
+    'вологда', 'воркута', 'воскресенск', 'воткинск', 'выборг', 'выкса', 'вязьма', 'гатчина',
+    'геленджик', 'горно-алтайск', 'грозный', 'губкин', 'гуково', 'гурьевск', 'дербент', 'долгопрудный',
+    'домодедово', 'дубна', 'евпатория', 'егорьевск', 'ейск', 'елец', 'ессентуки', 'железногорск',
+    'жигулёвск', 'жуковский', 'заречный', 'зеленодольск', 'златоуст', 'ивантеевка', 'ишим',
+    'ишимбай', 'йошкар-ола', 'кадников', 'каменск-уральский', 'каменск-шахтинский', 'карачаевск',
+    'кемерово', 'кинешма', 'кириши', 'киселёвск', 'клин', 'клинцы', 'ковров', 'коломна', 'комсомольск-на-амуре',
+    'копейск', 'коркино', 'кострома', 'котлас', 'красногорск', 'краснокаменск', 'краснокамск',
+    'кумертау', 'кунгур', 'курган', 'курчатов', 'кызыл', 'лабинск', 'лениногорск', 'лермонтов',
+    'лиски', 'лобня', 'лысьва', 'лыткарино', 'люберцы', 'магадан', 'магнитогорск', 'майкоп',
+    'миасс', 'минеральные воды', 'мичуринск', 'набережные челны', 'назрань', 'нальчик', 'наро-фоминск',
+    'невинномысск', 'нефтекамск', 'нефтеюганск', 'нижневартовск', 'нижнекамск', 'нижняя тура',
+    'новоалтайск', 'новокузнецк', 'новомосковск', 'новороссийск', 'новосибирск', 'новочебоксарск',
+    'новочеркасск', 'новошахтинск', 'ногинск', 'ноябрьск', 'нюрба', 'нягань', 'обнинск', 'одинцово',
+    'октябрьский', 'омск', 'орел', 'оренбург', 'орехово-зуево', 'орск', 'павлово', 'павловский посад',
+    'пенза', 'первоуральск', 'пермь', 'петрозаводск', 'петропавловск-камчатский', 'подольск',
+    'полевской', 'прокопьевск', 'прохладный', 'псков', 'пушкино', 'раменское', 'ревда', 'реутов',
+    'рославль', 'россошь', 'ростов-на-дону', 'рубцовск', 'рыбинск', 'рязань', 'салават', 'сальск',
+    'самара', 'санкт-петербург', 'саранск', 'сарапул', 'саратов', 'саров', 'свободный', 'северодвинск',
+    'северск', 'сергиев посад', 'серов', 'серпухов', 'симферополь', 'славянск-на-кубани', 'смоленск',
+    'соликамск', 'солнечногорск', 'сосновый бор', 'сочи', 'ставрополь', 'старый оскол', 'стерлитамак',
+    'ступино', 'сургут', 'сызрань', 'сыктывкар', 'таганрог', 'тамбов', 'тверь', 'тихвин', 'тихорецк',
+    'тобольск', 'тольятти', 'томск', 'троицк', 'туапсе', 'тула', 'тюмень', 'улан-удэ', 'ульяновск',
+    'уссурийск', 'усть-илимск', 'уфа', 'ухта', 'хабаровск', 'хадыженск', 'химки', 'чайковский',
+    'чапаевск', 'чебоксары', 'челябинск', 'черемхово', 'череповец', 'черкесск', 'черногорск',
+    'чехов', 'чистополь', 'чита', 'шадринск', 'шали', 'шахты', 'шуя', 'щекино', 'щелково', 'электросталь',
+    'элиста', 'энгельс', 'южно-сахалинск', 'юрга', 'якутск', 'ялта', 'ярославль'
+}
 
-# ========== КЛАВИАТУРЫ ==========
-def add_restart_button(keyboard):
-    return keyboard + [[InlineKeyboardButton("🔄 Перезапустить", callback_data='/start')]]
+def normalize_city_name(city: str) -> str:
+    return re.sub(r'[^\w\s-]', '', city.lower().strip())
 
+def is_valid_russian_city(city: str) -> bool:
+    normalized = normalize_city_name(city)
+    aliases = {
+        'спб': 'санкт-петербург',
+        'нск': 'новосибирск',
+        'екб': 'екатеринбург'
+    }
+    return normalized in RUSSIAN_CITIES or aliases.get(normalized) in RUSSIAN_CITIES
+
+# ========== KEYBOARDS ==========
 SNG_COUNTRIES = [
     ["🇧🇾 Беларусь", "🇰🇿 Казахстан"],
     ["🇺🇿 Узбекистан", "🇦🇲 Армения"],
@@ -159,25 +202,28 @@ SNG_COUNTRIES = [
     ["🌍 Другая страна", "🚫 Пропустить"]
 ]
 
-CITIZENSHIP_KEYBOARD = add_restart_button([["🇷🇺 РФ", "🌍 СНГ/Другое"]])
-PRIOR_EMPLOYMENT_KEYBOARD = add_restart_button([["✅ Да", "❌ Нет"]])
-EMPLOYMENT_PERIOD_KEYBOARD = add_restart_button([
-    ["📅 Меньше 40 дней назад"], 
-    ["🗓️ Больше 40 дней назад"]
-])
-STATUS_KEYBOARD = add_restart_button([["✅ Да", "❌ Нет"]])
-TRANSPORT_KEYBOARD = add_restart_button([["🚗 Авто", "🚲 Вело", "⚡ Электровело"]])
-SELF_EMPLOYED_CHOICE_KEYBOARD = add_restart_button([["📝 Оформить сейчас", "🏢 В офисе"]])
-CONFIRM_KEYBOARD = add_restart_button([["✅ Подтвердить", "✏️ Изменить"]])
-EDIT_FIELD_KEYBOARD = add_restart_button([
+CITIZENSHIP_KEYBOARD = [["🇷🇺 РФ", "🌍 СНГ/Другое"]]
+PRIOR_EMPLOYMENT_KEYBOARD = [["✅ Да", "❌ Нет"]]
+EMPLOYMENT_PERIOD_KEYBOARD = [["📅 Меньше 40 дней назад"], ["🗓️ Больше 40 дней назад"]]
+STATUS_KEYBOARD = [["✅ Да", "❌ Нет"]]
+TRANSPORT_KEYBOARD = [["🚗 Авто", "🚲 Вело", "⚡ Электровело"]]
+SELF_EMPLOYED_CHOICE_KEYBOARD = [["📝 Оформить сейчас", "🏢 В офисе"]]
+CONFIRM_KEYBOARD = [["✅ Подтвердить", "✏️ Изменить"]]
+EDIT_FIELD_KEYBOARD = [
     ["ФИО", "Телефон"],
     ["Город", "Возраст"],
     ["Транспорт", "Назад"]
-])
+]
 
-# ========== ОСНОВНЫЕ ОБРАБОТЧИКИ ==========
+# ========== HANDLERS ==========
 async def start(update: Update, context: CallbackContext) -> int:
+    if context.user_data.get('active'):
+        await update.message.reply_text("⚠️ Завершите текущую анкету!")
+        return ConversationHandler.END
+        
     context.user_data.clear()
+    context.user_data['active'] = True
+    
     await update.message.reply_text(
         "🌟 Добро пожаловать в МагнитДоставка! 🌟\n"
         "Выберите гражданство:",
@@ -199,7 +245,7 @@ async def citizenship(update: Update, context: CallbackContext) -> int:
         await update.message.reply_text(
             "🌐 Выберите вашу страну:",
             reply_markup=ReplyKeyboardMarkup(
-                add_restart_button(SNG_COUNTRIES),
+                SNG_COUNTRIES,
                 resize_keyboard=True
             )
         )
@@ -221,7 +267,7 @@ async def citizenship_sng(update: Update, context: CallbackContext) -> int:
         await update.message.reply_text(
             "🌐 Укажите ваше гражданство:",
             reply_markup=ReplyKeyboardMarkup(
-                add_restart_button([["🚫 Пропустить"]]),
+                [["🚫 Пропустить"]],
                 resize_keyboard=True
             )
         )
@@ -242,11 +288,29 @@ async def citizenship_other(update: Update, context: CallbackContext) -> int:
 
 async def full_name(update: Update, context: CallbackContext) -> int:
     full_name = update.message.text.strip()
-    if not re.match(r"^[А-ЯЁ][а-яё]+\s[А-ЯЁ][а-яё]+\s[А-ЯЁ][а-яё]+$", full_name):
-        await update.message.reply_text("❌ Введите ФИО в формате: Фамилия Имя Отчество")
+    full_name = ' '.join(full_name.split()).replace('--', '-')
+    
+    pattern = r"""
+        ^
+        [А-ЯЁ]
+        [а-яё-]+
+        (?:\s[А-ЯЁ][а-яё-]+){1,2}
+        $
+    """
+    
+    if not re.fullmatch(pattern, full_name, re.VERBOSE | re.IGNORECASE):
+        examples = "❌ Неверный формат ФИО. Примеры:\n• Иванов Иван\n• Петров-Водкин Алексей"
+        await update.message.reply_text(examples)
         return FULL_NAME
     
-    context.user_data["full_name"] = full_name
+    parts = full_name.split()
+    for part in parts:
+        if len(part.replace('-', '')) < 2:
+            await update.message.reply_text("❌ Каждая часть ФИО должна быть минимум из 2 букв")
+            return FULL_NAME
+    
+    context.user_data["full_name"] = full_name.title()
+    
     await update.message.reply_text(
         "📋 Ранее работали в МагнитДоставке?",
         reply_markup=ReplyKeyboardMarkup(
@@ -261,6 +325,7 @@ async def prior_employment(update: Update, context: CallbackContext) -> int:
     if answer not in ["✅ Да", "❌ Нет"]:
         await update.message.reply_text("Пожалуйста, выберите вариант из клавиатуры.")
         return PRIOR_EMPLOYMENT
+    
     context.user_data["prior_employment"] = answer
     
     if answer == "❌ Нет":
@@ -281,19 +346,13 @@ async def employment_period(update: Update, context: CallbackContext) -> int:
     valid_choices = ["📅 Меньше 40 дней назад", "🗓️ Больше 40 дней назад"]
     
     if period not in valid_choices:
-        await update.message.reply_text(
-            "Пожалуйста, выберите вариант из клавиатуры:",
-            reply_markup=ReplyKeyboardMarkup(
-                EMPLOYMENT_PERIOD_KEYBOARD,
-                resize_keyboard=True
-            )
-        )
+        await update.message.reply_text("Пожалуйста, выберите вариант из клавиатуры.")
         return EMPLOYMENT_PERIOD
     
     context.user_data["employment_period"] = period
     
     if period == "📅 Меньше 40 дней назад":
-        context.user_data["special_note"] = "🚨 <b>ВНИМАНИЕ: Кандидат работал менее 40 дней назад!</b>"
+        context.user_data["special_note"] = "🚨 ВНИМАНИЕ: Кандидат работал менее 40 дней назад!"
     
     await update.message.reply_text("📱 Введите номер телефона (начинается с +7, 7 или 8):")
     return PHONE
@@ -306,11 +365,7 @@ async def phone(update: Update, context: CallbackContext) -> int:
         clean_phone = '7' + clean_phone[1:]
     
     if not clean_phone.startswith('7') or len(clean_phone) != 11:
-        await update.message.reply_text(
-            "❌ Неверный формат номера. Примеры:\n"
-            "+79123456789\n79123456789\n89123456789",
-            reply_markup=ReplyKeyboardMarkup([["/start"]], resize_keyboard=True)
-        )
+        await update.message.reply_text("❌ Неверный формат номера. Примеры: +79123456789, 79123456789, 89123456789")
         return PHONE
     
     formatted_phone = f"+7 ({clean_phone[1:4]}) {clean_phone[4:7]}-{clean_phone[7:9]}-{clean_phone[9:11]}"
@@ -320,11 +375,24 @@ async def phone(update: Update, context: CallbackContext) -> int:
 
 async def city(update: Update, context: CallbackContext) -> int:
     city = update.message.text.strip()
-    if len(city) < 2 or any(c.isdigit() or c in '!@#$%^&*()_+={}[]|\\:;"<>,?/~`' for c in city):
-        await update.message.reply_text("❌ Введите корректное название города без цифр и спецсимволов.")
+    
+    if len(city) < 2:
+        await update.message.reply_text("❌ Название города слишком короткое")
         return CITY
     
-    context.user_data["city"] = city
+    if any(c.isdigit() or c in '!@#$%^&*()_+={}[]|\\:;"<>,?/~`' for c in city):
+        await update.message.reply_text("❌ Город не должен содержать цифры и спецсимволы")
+        return CITY
+    
+    if not is_valid_russian_city(city):
+        await update.message.reply_text(
+            "❌ Введите корректное название города России\n"
+            "Примеры: Москва, Санкт-Петербург, Казань\n"
+            "Или укажите ближайший крупный город"
+        )
+        return CITY
+    
+    context.user_data["city"] = city.title()
     await update.message.reply_text("📅 Введите ваш возраст:")
     return AGE
 
@@ -358,7 +426,6 @@ async def self_employed(update: Update, context: CallbackContext) -> int:
         return SELF_EMPLOYED
     
     context.user_data["self_employed"] = status
-    context.user_data.pop("self_employed_choice", None)
     
     if status == "❌ Нет":
         await update.message.reply_text(
@@ -382,13 +449,7 @@ async def self_employed(update: Update, context: CallbackContext) -> int:
 async def self_employed_choice(update: Update, context: CallbackContext) -> int:
     choice = update.message.text
     if choice not in ["📝 Оформить сейчас", "🏢 В офисе"]:
-        await update.message.reply_text(
-            "Пожалуйста, используйте кнопки ниже👇",
-            reply_markup=ReplyKeyboardMarkup(
-                SELF_EMPLOYED_CHOICE_KEYBOARD,
-                resize_keyboard=True
-            )
-        )
+        await update.message.reply_text("Пожалуйста, используйте кнопки ниже👇")
         return SELF_EMPLOYED_CHOICE
     
     context.user_data["self_employed_choice"] = choice
@@ -412,8 +473,6 @@ async def self_employed_choice(update: Update, context: CallbackContext) -> int:
 4. <b>Отправьте на проверку</b> ✅
 
 5. <b>Получите свидетельство</b> через 1-3 дня 🎉
-
-Готово! Теперь вы самозанятый!
 """
         await update.message.reply_text(
             instruction,
@@ -436,13 +495,7 @@ async def self_employed_choice(update: Update, context: CallbackContext) -> int:
 async def transport(update: Update, context: CallbackContext) -> int:
     transport = update.message.text
     if transport not in ["🚗 Авто", "🚲 Вело", "⚡ Электровело"]:
-        await update.message.reply_text(
-            "Пожалуйста, выберите транспорт из предложенных👇",
-            reply_markup=ReplyKeyboardMarkup(
-                TRANSPORT_KEYBOARD,
-                resize_keyboard=True
-            )
-        )
+        await update.message.reply_text("Пожалуйста, выберите транспорт из предложенных👇")
         return TRANSPORT
     
     context.user_data["transport"] = transport
@@ -471,67 +524,72 @@ async def confirmation(update: Update, context: CallbackContext) -> int:
     choice = update.message.text
     
     if choice == "✅ Подтвердить":
-        if not validate_application(context.user_data):
-            await update.message.reply_text(
-                "❌ Ошибка: Не все данные заполнены! Начните заново.",
-                reply_markup=ReplyKeyboardMarkup([["/start"]], resize_keyboard=True)
-            )
-            return ConversationHandler.END
-
-        user = update.message.from_user
-        app_id = save_application(
-            user_data=context.user_data,
-            user_id=user.id,
-            username=user.username
-        )
-        
-        if not app_id:
-            await update.message.reply_text(
-                "⚠️ Ошибка сохранения заявки. Пожалуйста, попробуйте снова.",
-                reply_markup=ReplyKeyboardMarkup([["/start"]], resize_keyboard=True)
-            )
-            return ConversationHandler.END
-
-        message = [
-            f"🔔 <b>Новая заявка #{app_id}</b>\n\n",
-            f"👤 Пользователь: @{user.username or 'не указан'} (ID: {user.id})\n",
-            f"▫️ Возраст: {context.user_data.get('age', '—')}\n",
-            f"▫️ Гражданство: {context.user_data.get('citizenship', '—')}\n",
-            f"▫️ ФИО: {context.user_data.get('full_name', '—')}\n",
-            f"▫️ Телефон: {context.user_data.get('phone', '—')}\n",
-            f"▫️ Город: {context.user_data.get('city', '—')}\n",
-            f"▫️ Самозанятый: {context.user_data.get('self_employed', '—')}\n"
+        required_fields = [
+            'citizenship', 'full_name', 'phone',
+            'city', 'age', 'self_employed', 'transport'
         ]
         
-        if choice := context.user_data.get('self_employed_choice'):
-            message.append(f"▫️ Оформление: {choice}\n")
-        
-        message.append(f"▫️ Транспорт: {context.user_data.get('transport', '—')}\n")
-        
-        if context.user_data.get('special_note'):
-            message.append(f"\n{context.user_data['special_note']}")
-        
-        if context.user_data.get('age_warning'):
-            message.append("\n🚨 <b>ВНИМАНИЕ: Кандидат несовершеннолетний!</b>")
+        missing = [field for field in required_fields if field not in context.user_data]
+        if missing:
+            await update.message.reply_text(
+                f"❌ Ошибка: Отсутствуют данные ({', '.join(missing)})"
+            )
+            context.user_data.clear()
+            return ConversationHandler.END
 
-        keyboard = [
-            [
-                InlineKeyboardButton("✅ Принять", callback_data=f"approve_{app_id}"),
-                InlineKeyboardButton("❌ Отклонить", callback_data=f"reject_{app_id}")
+        try:
+            user = update.message.from_user
+            app_id = save_application(
+                user_data=context.user_data,
+                user_id=user.id,
+                username=user.username
+            )
+            
+            if not app_id:
+                raise ValueError("Ошибка сохранения в БД")
+
+            message = [
+                f"🔔 <b>Новая заявка #{app_id}</b>\n\n",
+                f"👤 Пользователь: @{user.username or 'не указан'} (ID: {user.id})\n",
+                f"▫️ ФИО: {context.user_data['full_name']}\n",
+                f"▫️ Телефон: {context.user_data['phone']}\n",
+                f"▫️ Город: {context.user_data['city']}\n",
+                f"▫️ Возраст: {context.user_data['age']}\n",
+                f"▫️ Транспорт: {context.user_data['transport']}\n"
             ]
-        ]
 
-        await context.bot.send_message(
-            chat_id=ADMIN_CHAT_ID,
-            text="".join(message),
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
+            if context.user_data.get('age', 0) < 18:
+                message.append("\n🚨 <b>ВНИМАНИЕ: Несовершеннолетний кандидат!</b>")
 
-        await update.message.reply_text(
-            "✅ Заявка принята! Ожидайте звонка.",
-            reply_markup=ReplyKeyboardMarkup([["/start"]], resize_keyboard=True)
-        )
+            if 'special_note' in context.user_data:
+                message.append(f"\n{context.user_data['special_note']}")
+
+            await context.bot.send_message(
+                chat_id=ADMIN_CHAT_ID,
+                text="".join(message),
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("✅ Принять", callback_data=f"approve_{app_id}"),
+                    InlineKeyboardButton("❌ Отклонить", callback_data=f"reject_{app_id}")
+                ]])
+            )
+
+            await update.message.reply_text(
+                "✅ Заявка принята! Ожидайте звонка.",
+                reply_markup=ReplyKeyboardRemove()
+            )
+
+        except sqlite3.Error as e:
+            logger.error(f"Ошибка БД: {str(e)}")
+            await update.message.reply_text("⚠️ Ошибка базы данных. Попробуйте позже.")
+            
+        except Exception as e:
+            logger.error(f"Критическая ошибка: {str(e)}")
+            await update.message.reply_text("⚠️ Произошла ошибка. Попробуйте еще раз.")
+            
+        finally:
+            context.user_data.clear()
+        
         return ConversationHandler.END
         
     elif choice == "✏️ Изменить":
@@ -563,61 +621,54 @@ async def edit_field_handler(update: Update, context: CallbackContext) -> int:
         return TRANSPORT
     
     if field not in valid_fields:
-        await update.message.reply_text(
-            "Пожалуйста, выберите поле из списка",
-            reply_markup=ReplyKeyboardMarkup(
-                EDIT_FIELD_KEYBOARD,
-                resize_keyboard=True
-            )
-        )
+        await update.message.reply_text("Пожалуйста, выберите поле из списка")
         return EDIT_FIELD
     
     context.user_data["editing_field"] = field
-    await update.message.reply_text(f"Введите новое значение для поля '{field}':")
     
-    return {
-        "ФИО": FULL_NAME,
-        "Телефон": PHONE,
-        "Город": CITY,
-        "Возраст": AGE,
-        "Транспорт": TRANSPORT
-    }[field]
+    if field == "Транспорт":
+        await update.message.reply_text(
+            "🚗 Выберите транспорт:",
+            reply_markup=ReplyKeyboardMarkup(
+                TRANSPORT_KEYBOARD,
+                resize_keyboard=True
+            )
+        )
+        return TRANSPORT
+    else:
+        await update.message.reply_text(f"Введите новое значение для поля '{field}':")
+        return {
+            "ФИО": FULL_NAME,
+            "Телефон": PHONE,
+            "Город": CITY,
+            "Возраст": AGE
+        }[field]
 
 async def cancel(update: Update, context: CallbackContext) -> int:
     await update.message.reply_text(
         "❌ Диалог прерван.",
-        reply_markup=ReplyKeyboardMarkup([["/start"]], resize_keyboard=True)
+        reply_markup=ReplyKeyboardRemove()
     )
+    context.user_data.clear()
     return ConversationHandler.END
 
 async def error_handler(update: Update, context: CallbackContext):
-    logger.error(msg="Ошибка в обработчике:", exc_info=context.error)
-    
-    if update and update.message:
-        await update.message.reply_text(
-            "⚠️ Произошла ошибка. Пожалуйста, попробуйте снова.",
-            reply_markup=ReplyKeyboardMarkup([["/start"]], resize_keyboard=True)
-        )
+    logger.error(msg="Ошибка:", exc_info=context.error)
+    if update.message:
+        await update.message.reply_text("⚠️ Произошла внутренняя ошибка. Пожалуйста, попробуйте еще раз.")
 
-# ========== АДМИН-КОМАНДЫ ==========
+# ========== ADMIN COMMANDS ==========
 async def admin_stats(update: Update, context: CallbackContext):
-    if update.message.from_user.id != ADMIN_CHAT_ID:
+    if update.effective_user.id != ADMIN_CHAT_ID:
         return
     
     conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    
     try:
+        cursor = conn.cursor()
         cursor.execute("SELECT status, COUNT(*) FROM applications GROUP BY status")
         stats = dict(cursor.fetchall())
         
-        cursor.execute("""
-            SELECT id, created_at, city 
-            FROM applications 
-            WHERE status = 'new'
-            ORDER BY created_at DESC 
-            LIMIT 5
-        """)
+        cursor.execute("SELECT id, created_at, city FROM applications WHERE status = 'new' ORDER BY created_at DESC LIMIT 5")
         last_apps = cursor.fetchall()
         
         message = [
@@ -630,96 +681,11 @@ async def admin_stats(update: Update, context: CallbackContext):
         for app in last_apps:
             message.append(f"#{app[0]} - {app[2]} ({app[1][:16]})\n")
             
-        await update.message.reply_text(
-            "\n".join(message),
-            parse_mode="HTML"
-        )
+        await update.message.reply_text("\n".join(message), parse_mode="HTML")
         
     except sqlite3.Error as e:
-        logger.error(f"Ошибка БД: {e}")
+        logger.error(f"DB Error: {e}")
         await update.message.reply_text("❌ Ошибка получения статистики")
-    finally:
-        conn.close()
-
-async def approve_application(update: Update, context: CallbackContext):
-    if update.effective_user.id != ADMIN_CHAT_ID:
-        return
-    
-    try:
-        app_id = int(context.args[0])
-        conn = sqlite3.connect(DB_NAME)
-        cursor = conn.cursor()
-        
-        cursor.execute("""
-            UPDATE applications 
-            SET status = 'approved' 
-            WHERE id = ? AND status = 'new'
-        """, (app_id,))
-        
-        if cursor.rowcount == 0:
-            await update.message.reply_text("⚠️ Заявка не найдена или уже обработана")
-            return
-        
-        cursor.execute("SELECT user_id, full_name FROM applications WHERE id = ?", (app_id,))
-        user_id, full_name = cursor.fetchone()
-        
-        try:
-            await context.bot.send_message(
-                chat_id=user_id,
-                text=f"🎉 {full_name}, ваша заявка одобрена! С вами свяжутся в ближайшее время."
-            )
-        except telegram_error.TelegramError as e:
-            logger.error(f"Ошибка отправки уведомления: {e}")
-        
-        await update.message.reply_text(f"✅ Заявка #{app_id} одобрена")
-        conn.commit()
-        
-    except (IndexError, ValueError):
-        await update.message.reply_text("Используйте: /approve <ID_заявки>")
-    except Exception as e:
-        logger.error(f"Ошибка approve: {e}")
-        await update.message.reply_text("❌ Ошибка обработки")
-    finally:
-        conn.close()
-
-async def reject_application(update: Update, context: CallbackContext):
-    if update.effective_user.id != ADMIN_CHAT_ID:
-        return
-    
-    try:
-        app_id = int(context.args[0])
-        conn = sqlite3.connect(DB_NAME)
-        cursor = conn.cursor()
-        
-        cursor.execute("""
-            UPDATE applications 
-            SET status = 'rejected' 
-            WHERE id = ? AND status = 'new'
-        """, (app_id,))
-        
-        if cursor.rowcount == 0:
-            await update.message.reply_text("⚠️ Заявка не найдена или уже обработана")
-            return
-        
-        cursor.execute("SELECT user_id, full_name FROM applications WHERE id = ?", (app_id,))
-        user_id, full_name = cursor.fetchone()
-        
-        try:
-            await context.bot.send_message(
-                chat_id=user_id,
-                text=f"😞 {full_name}, к сожалению, ваша заявка отклонена."
-            )
-        except telegram_error.TelegramError as e:
-            logger.error(f"Ошибка отправки уведомления: {e}")
-        
-        await update.message.reply_text(f"✅ Заявка #{app_id} отклонена")
-        conn.commit()
-        
-    except (IndexError, ValueError):
-        await update.message.reply_text("Используйте: /reject <ID_заявки>")
-    except Exception as e:
-        logger.error(f"Ошибка reject: {e}")
-        await update.message.reply_text("❌ Ошибка обработки")
     finally:
         conn.close()
 
@@ -727,21 +693,21 @@ async def button_callback(update: Update, context: CallbackContext):
     query = update.callback_query
     await query.answer()
     
-    if not query.data or not query.from_user.id == ADMIN_CHAT_ID:
+    if query.from_user.id != ADMIN_CHAT_ID:
+        await query.message.reply_text("❌ Доступ запрещен")
         return
 
-    action, app_id = query.data.split('_')
-    app_id = int(app_id)
+    try:
+        action, app_id = query.data.split('_')
+        app_id = int(app_id)
+    except:
+        logger.error("Invalid callback data")
+        return
 
     conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-
     try:
-        cursor.execute("""
-            SELECT status, user_id, full_name 
-            FROM applications 
-            WHERE id = ?
-        """, (app_id,))
+        cursor = conn.cursor()
+        cursor.execute("SELECT status, user_id, full_name FROM applications WHERE id = ?", (app_id,))
         result = cursor.fetchone()
         
         if not result:
@@ -755,45 +721,31 @@ async def button_callback(update: Update, context: CallbackContext):
             return
 
         new_status = 'approved' if action == 'approve' else 'rejected'
-        cursor.execute("""
-            UPDATE applications 
-            SET status = ? 
-            WHERE id = ?
-        """, (new_status, app_id))
+        cursor.execute("UPDATE applications SET status = ? WHERE id = ?", (new_status, app_id))
+        conn.commit()
 
         try:
-            text = (
-                f"🎉 {full_name}, ваша заявка одобрена!" 
-                if action == 'approve' 
-                else f"😞 {full_name}, ваша заявка отклонена"
-            )
-            await context.bot.send_message(
-                chat_id=user_id,
-                text=text
-            )
-        except telegram_error.TelegramError as e:
-            logger.error(f"Ошибка уведомления пользователя: {e}")
+            message_text = "🎉 Ваша заявка одобрена!" if action == 'approve' else "😞 Заявка отклонена."
+            await context.bot.send_message(user_id, f"🔔 Уведомление для {full_name}:\n{message_text}")
+        except telegram_error.BadRequest:
+            logger.warning(f"User {user_id} blocked the bot")
 
-        new_text = query.message.text + f"\n\n🟢 Статус: {new_status.upper()}"
         await query.edit_message_text(
-            text=new_text,
+            text=query.message.text.replace("Статус: new", f"Статус: {new_status}"),
             parse_mode="HTML",
             reply_markup=None
         )
 
-        conn.commit()
-        
     except Exception as e:
-        logger.error(f"Ошибка обработки callback: {e}")
-        await query.edit_message_text(text=f"❌ Ошибка обработки заявки #{app_id}")
+        logger.error(f"Callback error: {e}")
+        await query.edit_message_text(text=f"❌ Ошибка: {str(e)}")
     finally:
         conn.close()
 
-# ========== ЗАПУСК ПРИЛОЖЕНИЯ ==========
+# ========== MAIN ==========
 def main():
     init_db()
     
-    # Запуск Flask в отдельном потоке
     flask_thread = Thread(target=run_flask)
     flask_thread.daemon = True
     flask_thread.start()
@@ -826,13 +778,11 @@ def main():
 
     application.add_handler(conv_handler)
     application.add_handler(CommandHandler("stats", admin_stats))
-    application.add_handler(CommandHandler("approve", approve_application))
-    application.add_handler(CommandHandler("reject", reject_application))
     application.add_handler(CallbackQueryHandler(button_callback))
     application.add_error_handler(error_handler)
 
     def shutdown(signum, frame):
-        print("\n🛑 Завершение работы бота...")
+        print("\n🛑 Завершение работы...")
         application.stop()
         exit(0)
 
